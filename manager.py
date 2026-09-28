@@ -1,19 +1,20 @@
 import json
+import random
 import socket
 import sys
 
 
-# Stores information about every registered peer.
 peers = {}
 
+dht_exists = False
+dht_complete = False
+dht_leader = None
+dht_members = []
+dht_size = 0
+dht_year = None
 
-def send_response(manager_socket, address, status, message):
-    """Send a JSON response to a peer."""
-    response = {
-        "status": status,
-        "message": message
-    }
 
+def send_response(manager_socket, address, response):
     manager_socket.sendto(
         json.dumps(response).encode("utf-8"),
         address
@@ -21,8 +22,6 @@ def send_response(manager_socket, address, status, message):
 
 
 def handle_register(manager_socket, message, sender_address):
-    """Process a register request from a peer."""
-
     peer_name = message.get("peer_name")
     peer_ip = message.get("ip")
     m_port = message.get("m_port")
@@ -30,7 +29,6 @@ def handle_register(manager_socket, message, sender_address):
 
     print(f"[MANAGER] Processing REGISTER for {peer_name}")
 
-    # Peer names must be alphabetic and at most 15 characters.
     if (
         not isinstance(peer_name, str)
         or not peer_name.isalpha()
@@ -40,23 +38,87 @@ def handle_register(manager_socket, message, sender_address):
         send_response(
             manager_socket,
             sender_address,
-            "FAILURE",
-            "Invalid peer name"
+            {
+                "status": "FAILURE",
+                "message": "Invalid peer name"
+            }
         )
         return
 
-    # A peer name may only be registered once.
+    if not isinstance(peer_ip, str):
+        print("[MANAGER] REGISTER failed: invalid IPv4 address")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Invalid IPv4 address"
+            }
+        )
+        return
+
+    try:
+        socket.inet_aton(peer_ip)
+    except OSError:
+        print("[MANAGER] REGISTER failed: invalid IPv4 address")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Invalid IPv4 address"
+            }
+        )
+        return
+
+    if not isinstance(m_port, int) or not isinstance(p_port, int):
+        print("[MANAGER] REGISTER failed: invalid port")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Ports must be integers"
+            }
+        )
+        return
+
+    if not (1 <= m_port <= 65535 and 1 <= p_port <= 65535):
+        print("[MANAGER] REGISTER failed: port outside valid range")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Port outside valid range"
+            }
+        )
+        return
+
+    if m_port == p_port:
+        print("[MANAGER] REGISTER failed: m-port and p-port must be different")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "m-port and p-port must be different"
+            }
+        )
+        return
+
     if peer_name in peers:
         print("[MANAGER] REGISTER failed: duplicate peer name")
         send_response(
             manager_socket,
             sender_address,
-            "FAILURE",
-            "Peer name is already registered"
+            {
+                "status": "FAILURE",
+                "message": "Peer name is already registered"
+            }
         )
         return
 
-    # Ports used by peer processes must be unique.
     for existing_peer in peers.values():
         existing_ports = {
             existing_peer["m_port"],
@@ -68,23 +130,13 @@ def handle_register(manager_socket, message, sender_address):
             send_response(
                 manager_socket,
                 sender_address,
-                "FAILURE",
-                "Port is already in use by another peer"
+                {
+                    "status": "FAILURE",
+                    "message": "Port is already in use by another peer"
+                }
             )
             return
 
-    # m-port and p-port must also be different from each other.
-    if m_port == p_port:
-        print("[MANAGER] REGISTER failed: m-port and p-port are identical")
-        send_response(
-            manager_socket,
-            sender_address,
-            "FAILURE",
-            "m-port and p-port must be different"
-        )
-        return
-
-    # Store the new peer.
     peers[peer_name] = {
         "ip": peer_ip,
         "m_port": m_port,
@@ -98,8 +150,143 @@ def handle_register(manager_socket, message, sender_address):
     send_response(
         manager_socket,
         sender_address,
-        "SUCCESS",
-        f"{peer_name} registered successfully"
+        {
+            "status": "SUCCESS",
+            "message": f"{peer_name} registered successfully"
+        }
+    )
+
+
+def handle_setup_dht(manager_socket, message, sender_address):
+    global dht_exists
+    global dht_complete
+    global dht_leader
+    global dht_members
+    global dht_size
+    global dht_year
+
+    peer_name = message.get("peer_name")
+    n = message.get("n")
+    year = message.get("year")
+
+    print(
+        f"[MANAGER] Processing SETUP-DHT from {peer_name}: "
+        f"n={n}, year={year}"
+    )
+
+    if peer_name not in peers:
+        print("[MANAGER] SETUP-DHT failed: peer is not registered")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Peer is not registered"
+            }
+        )
+        return
+
+    if not isinstance(n, int) or n < 3:
+        print("[MANAGER] SETUP-DHT failed: n must be at least 3")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "DHT size must be at least 3"
+            }
+        )
+        return
+
+    if len(peers) < n:
+        print("[MANAGER] SETUP-DHT failed: not enough registered peers")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Not enough registered peers"
+            }
+        )
+        return
+
+    if dht_exists:
+        print("[MANAGER] SETUP-DHT failed: DHT already exists")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "A DHT already exists"
+            }
+        )
+        return
+
+    free_peers = [
+        name
+        for name, info in peers.items()
+        if name != peer_name and info["state"] == "Free"
+    ]
+
+    if len(free_peers) < n - 1:
+        print("[MANAGER] SETUP-DHT failed: not enough Free peers")
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Not enough Free peers"
+            }
+        )
+        return
+
+    selected_names = random.sample(free_peers, n - 1)
+
+    peers[peer_name]["state"] = "Leader"
+
+    for name in selected_names:
+        peers[name]["state"] = "InDHT"
+
+    dht_leader = peer_name
+    dht_members = [peer_name] + selected_names
+    dht_size = n
+    dht_year = year
+    dht_exists = True
+    dht_complete = False
+
+    selected_peers = []
+
+    for name in dht_members:
+        info = peers[name]
+
+        selected_peers.append(
+            {
+                "peer_name": name,
+                "ip": info["ip"],
+                "p_port": info["p_port"]
+            }
+        )
+
+    print(f"[MANAGER] SETUP-DHT successful")
+    print(f"[MANAGER] Leader: {dht_leader}")
+    print(f"[MANAGER] DHT members: {dht_members}")
+
+    for name in dht_members:
+        print(
+            f"[MANAGER] {name}: "
+            f"{peers[name]['state']}"
+        )
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "DHT peer selection successful",
+            "n": n,
+            "year": year,
+            "peers": selected_peers
+        }
     )
 
 
@@ -112,6 +299,10 @@ def main():
         manager_port = int(sys.argv[1])
     except ValueError:
         print("Error: port must be an integer.")
+        sys.exit(1)
+
+    if not (1 <= manager_port <= 65535):
+        print("Error: port must be between 1 and 65535.")
         sys.exit(1)
 
     manager_socket = socket.socket(
@@ -136,12 +327,15 @@ def main():
             try:
                 message = json.loads(data.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                print("[MANAGER] Received invalid message")
+                print("[MANAGER] Received invalid message format")
+
                 send_response(
                     manager_socket,
                     sender_address,
-                    "FAILURE",
-                    "Invalid message format"
+                    {
+                        "status": "FAILURE",
+                        "message": "Invalid message format"
+                    }
                 )
                 continue
 
@@ -158,13 +352,24 @@ def main():
                     message,
                     sender_address
                 )
+
+            elif command == "setup-dht":
+                handle_setup_dht(
+                    manager_socket,
+                    message,
+                    sender_address
+                )
+
             else:
                 print(f"[MANAGER] Unknown command: {command}")
+
                 send_response(
                     manager_socket,
                     sender_address,
-                    "FAILURE",
-                    "Unknown command"
+                    {
+                        "status": "FAILURE",
+                        "message": "Unknown command"
+                    }
                 )
 
     except KeyboardInterrupt:
