@@ -12,6 +12,7 @@ dht_leader = None
 dht_members = []
 dht_size = 0
 dht_year = None
+waiting_for_dht_complete = False
 
 
 def send_response(manager_socket, address, response):
@@ -164,6 +165,7 @@ def handle_setup_dht(manager_socket, message, sender_address):
     global dht_members
     global dht_size
     global dht_year
+    global waiting_for_dht_complete
 
     peer_name = message.get("peer_name")
     n = message.get("n")
@@ -175,7 +177,6 @@ def handle_setup_dht(manager_socket, message, sender_address):
     )
 
     if peer_name not in peers:
-        print("[MANAGER] SETUP-DHT failed: peer is not registered")
         send_response(
             manager_socket,
             sender_address,
@@ -187,7 +188,6 @@ def handle_setup_dht(manager_socket, message, sender_address):
         return
 
     if not isinstance(n, int) or n < 3:
-        print("[MANAGER] SETUP-DHT failed: n must be at least 3")
         send_response(
             manager_socket,
             sender_address,
@@ -199,7 +199,6 @@ def handle_setup_dht(manager_socket, message, sender_address):
         return
 
     if len(peers) < n:
-        print("[MANAGER] SETUP-DHT failed: not enough registered peers")
         send_response(
             manager_socket,
             sender_address,
@@ -211,7 +210,6 @@ def handle_setup_dht(manager_socket, message, sender_address):
         return
 
     if dht_exists:
-        print("[MANAGER] SETUP-DHT failed: DHT already exists")
         send_response(
             manager_socket,
             sender_address,
@@ -229,7 +227,6 @@ def handle_setup_dht(manager_socket, message, sender_address):
     ]
 
     if len(free_peers) < n - 1:
-        print("[MANAGER] SETUP-DHT failed: not enough Free peers")
         send_response(
             manager_socket,
             sender_address,
@@ -253,6 +250,7 @@ def handle_setup_dht(manager_socket, message, sender_address):
     dht_year = year
     dht_exists = True
     dht_complete = False
+    waiting_for_dht_complete = True
 
     selected_peers = []
 
@@ -267,15 +265,12 @@ def handle_setup_dht(manager_socket, message, sender_address):
             }
         )
 
-    print(f"[MANAGER] SETUP-DHT successful")
+    print("[MANAGER] SETUP-DHT successful")
     print(f"[MANAGER] Leader: {dht_leader}")
     print(f"[MANAGER] DHT members: {dht_members}")
 
     for name in dht_members:
-        print(
-            f"[MANAGER] {name}: "
-            f"{peers[name]['state']}"
-        )
+        print(f"[MANAGER] {name}: {peers[name]['state']}")
 
     send_response(
         manager_socket,
@@ -286,6 +281,42 @@ def handle_setup_dht(manager_socket, message, sender_address):
             "n": n,
             "year": year,
             "peers": selected_peers
+        }
+    )
+
+
+def handle_dht_complete(manager_socket, message, sender_address):
+    global dht_complete
+    global waiting_for_dht_complete
+
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing DHT-COMPLETE from {peer_name}")
+
+    if peer_name != dht_leader:
+        print("[MANAGER] DHT-COMPLETE failed: sender is not leader")
+
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Peer is not the DHT leader"
+            }
+        )
+        return
+
+    dht_complete = True
+    waiting_for_dht_complete = False
+
+    print("[MANAGER] DHT construction complete")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "DHT construction complete"
         }
     )
 
@@ -327,8 +358,6 @@ def main():
             try:
                 message = json.loads(data.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                print("[MANAGER] Received invalid message format")
-
                 send_response(
                     manager_socket,
                     sender_address,
@@ -346,6 +375,22 @@ def main():
                 f"{sender_address[0]}:{sender_address[1]}"
             )
 
+            if waiting_for_dht_complete and command != "dht-complete":
+                print(
+                    f"[MANAGER] Rejecting {command}: "
+                    "waiting for DHT-COMPLETE"
+                )
+
+                send_response(
+                    manager_socket,
+                    sender_address,
+                    {
+                        "status": "FAILURE",
+                        "message": "DHT construction is in progress"
+                    }
+                )
+                continue
+
             if command == "register":
                 handle_register(
                     manager_socket,
@@ -360,9 +405,14 @@ def main():
                     sender_address
                 )
 
-            else:
-                print(f"[MANAGER] Unknown command: {command}")
+            elif command == "dht-complete":
+                handle_dht_complete(
+                    manager_socket,
+                    message,
+                    sender_address
+                )
 
+            else:
                 send_response(
                     manager_socket,
                     sender_address,
