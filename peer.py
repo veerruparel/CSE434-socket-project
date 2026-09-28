@@ -67,11 +67,13 @@ def configure_right_neighbor(state):
     if state["id"] is None or not state["dht_peers"]:
         return
 
+    # Next ID in the ring wraps back to zero
     next_id = (state["id"] + 1) % state["ring_size"]
     state["right_neighbor"] = state["dht_peers"][next_id]
 
 
 def store_local_record(state, position, record):
+    # Keep collisions at the same position instead of losing a record
     if position not in state["local_hash_table"]:
         state["local_hash_table"][position] = []
 
@@ -120,6 +122,7 @@ def handle_store(message, p_socket, state):
         )
         return
 
+    # Pass the record to the next peer in the ring
     send_p2p_message(
         p_socket,
         state["right_neighbor"],
@@ -266,12 +269,10 @@ def load_dataset(year):
             "the provided 1950 dataset available."
         )
 
-    filename = DATASET_1950
-
     records = []
 
     with open(
-        filename,
+        DATASET_1950,
         "r",
         encoding="utf-8-sig",
         newline=""
@@ -293,6 +294,7 @@ def load_dataset(year):
                 + ", ".join(missing_fields)
             )
 
+        # Only keep the fields needed by the project
         for row in reader:
             record = {
                 field: row.get(field, "")
@@ -341,15 +343,9 @@ def distribute_records(p_socket, state, records):
     for record in records:
         event_id = int(record["EVENT_ID"])
 
-        position = (
-            event_id
-            % state["hash_table_size"]
-        )
-
-        destination_id = (
-            position
-            % state["ring_size"]
-        )
+        # Hash the event to a position and peer ID
+        position = event_id % state["hash_table_size"]
+        destination_id = position % state["ring_size"]
 
         if destination_id == state["id"]:
             store_local_record(
@@ -387,6 +383,7 @@ def collect_record_counts(p_socket, state):
         }
     }
 
+    # Send the count request once around the ring
     send_p2p_message(
         p_socket,
         state["right_neighbor"],
@@ -471,10 +468,7 @@ def build_dht(
         records = load_dataset(
             state["year"]
         )
-    except (
-        OSError,
-        ValueError
-    ) as error:
+    except (OSError, ValueError) as error:
         print(
             f"[PEER {state['peer_name']}] "
             f"Dataset error: {error}"
@@ -483,6 +477,7 @@ def build_dht(
 
     record_count = len(records)
 
+    # Hash table size is the first prime larger than 2 * records
     state["hash_table_size"] = next_prime(
         2 * record_count
     )
@@ -519,6 +514,7 @@ def build_dht(
     ):
         return
 
+    # Total should match the number of rows read from the file
     if state["distributed_total"] != record_count:
         print(
             f"[PEER {state['peer_name']}] "

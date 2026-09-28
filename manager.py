@@ -4,6 +4,7 @@ import socket
 import sys
 
 
+# Keeps track of all registered peers
 peers = {}
 
 dht_exists = False
@@ -108,6 +109,7 @@ def handle_register(manager_socket, message, sender_address):
         )
         return
 
+    # Peer names cannot be registered more than once
     if peer_name in peers:
         print("[MANAGER] REGISTER failed: duplicate peer name")
         send_response(
@@ -120,6 +122,7 @@ def handle_register(manager_socket, message, sender_address):
         )
         return
 
+    # Each peer needs its own ports
     for existing_peer in peers.values():
         existing_ports = {
             existing_peer["m_port"],
@@ -237,6 +240,7 @@ def handle_setup_dht(manager_socket, message, sender_address):
         )
         return
 
+    # Pick the other peers that will be part of the DHT
     selected_names = random.sample(free_peers, n - 1)
 
     peers[peer_name]["state"] = "Leader"
@@ -375,6 +379,7 @@ def main():
                 f"{sender_address[0]}:{sender_address[1]}"
             )
 
+            # Manager waits for setup to finish before accepting other commands
             if waiting_for_dht_complete and command != "dht-complete":
                 print(
                     f"[MANAGER] Rejecting {command}: "
