@@ -1,0 +1,10 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+*.out
+*.tmp
+*.pdf
+*.png
+*.csv

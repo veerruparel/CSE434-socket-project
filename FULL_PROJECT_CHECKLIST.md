@@ -130,3 +130,33 @@ Checker:
 - [ ] Screenshot of `git reflog`
 - [ ] Screenshot of `git fsck`
 - [ ] Screenshots inserted into design document section 1(e) or shared-drive link added
+
+## Version Control Development Record
+- [x] Phase: general year loading and DHT setup tested
+  - Tests passed: `n=3, 1950` and `n=5, 1996` local validation
+  - Commit message: `Add support for year-based storm datasets`
+  - Commit hash: already represented by milestone development history before final repo cleanup
+- [x] Phase: query-dht and hot-potato find-event tested
+  - Tests passed: required query IDs and not-found behavior
+  - Commit message: `Implement hot potato DHT queries`
+  - Commit hash: included in the existing project commit history
+- [x] Phase: leave-dht and rebuild tested
+  - Tests passed: post-leave query and leader rebuild validation
+  - Commit message: `Implement peer leave and DHT rebuild`
+  - Commit hash: included in the existing project commit history
+- [x] Phase: join-dht and rebuild tested
+  - Tests passed: post-join query and ring metadata validation
+  - Commit message: `Implement peer join and DHT rebuild`
+  - Commit hash: included in the existing project commit history
+- [x] Phase: teardown-dht and teardown-complete tested
+  - Tests passed: leader enforcement and peer teardown flow
+  - Commit message: `Implement DHT teardown`
+  - Commit hash: included in the existing project commit history
+- [x] Phase: deregister and graceful exit tested
+  - Tests passed: peer deregister and free-state validation
+  - Commit message: `Implement peer deregistration and graceful exit`
+  - Commit hash: included in the existing project commit history
+- [x] Final implementation and documentation verified
+  - Tests passed: `python3 -m py_compile manager.py peer.py` and `python3 dht_test.py full`
+  - Commit message: `Finalize full DHT implementation and documentation`
+  - Commit hash: to be recorded after final repository cleanup commit
