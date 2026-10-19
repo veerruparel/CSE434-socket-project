@@ -15,6 +15,11 @@ dht_size = 0
 dht_year = None
 waiting_for_dht_complete = False
 
+# Set while the manager waits for dht-rebuilt or teardown-complete
+pending_command = None
+pending_peer = None
+pending_op = None
+
 
 def send_response(manager_socket, address, response):
     manager_socket.sendto(
@@ -201,6 +206,17 @@ def handle_setup_dht(manager_socket, message, sender_address):
         )
         return
 
+    if peers[peer_name]["state"] != "Free":
+        send_response(
+            manager_socket,
+            sender_address,
+            {
+                "status": "FAILURE",
+                "message": "Peer must be Free to set up a DHT"
+            }
+        )
+        return
+
     if len(peers) < n:
         send_response(
             manager_socket,
@@ -325,6 +341,308 @@ def handle_dht_complete(manager_socket, message, sender_address):
     )
 
 
+def failure(manager_socket, sender_address, text):
+    print(f"[MANAGER] FAILURE: {text}")
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "FAILURE",
+            "message": text
+        }
+    )
+
+
+def peer_tuple(name):
+    return {
+        "peer_name": name,
+        "ip": peers[name]["ip"],
+        "p_port": peers[name]["p_port"]
+    }
+
+
+def refresh_states():
+    # Leader and InDHT follow the member list, everyone else is Free
+    for name in dht_members:
+        peers[name]["state"] = "InDHT"
+
+    if dht_leader in peers:
+        peers[dht_leader]["state"] = "Leader"
+
+
+def clear_dht():
+    global dht_exists
+    global dht_complete
+    global dht_leader
+    global dht_members
+    global dht_size
+    global dht_year
+
+    for name in dht_members:
+        if name in peers:
+            peers[name]["state"] = "Free"
+
+    dht_exists = False
+    dht_complete = False
+    dht_leader = None
+    dht_members = []
+    dht_size = 0
+    dht_year = None
+
+
+def handle_query_dht(manager_socket, message, sender_address):
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing QUERY-DHT from {peer_name}")
+
+    if not dht_exists or not dht_complete:
+        failure(manager_socket, sender_address, "DHT is not set up")
+        return
+
+    if peer_name not in peers:
+        failure(manager_socket, sender_address, "Peer is not registered")
+        return
+
+    if peers[peer_name]["state"] != "Free":
+        failure(manager_socket, sender_address, "Peer is not Free")
+        return
+
+    # Any peer in the DHT can start the query
+    target = random.choice(dht_members)
+
+    print(f"[MANAGER] QUERY-DHT successful: start at {target}")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "DHT peer selected",
+            "peer": peer_tuple(target)
+        }
+    )
+
+
+def handle_leave_dht(manager_socket, message, sender_address):
+    global pending_command
+    global pending_peer
+    global pending_op
+
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing LEAVE-DHT from {peer_name}")
+
+    if not dht_exists or not dht_complete:
+        failure(manager_socket, sender_address, "DHT does not exist")
+        return
+
+    if peer_name not in dht_members:
+        failure(manager_socket, sender_address, "Peer is not in the DHT")
+        return
+
+    # A ring needs at least two peers to stay a ring
+    if len(dht_members) <= 2:
+        failure(manager_socket, sender_address, "DHT is too small to leave; use teardown-dht")
+        return
+
+    pending_command = "dht-rebuilt"
+    pending_peer = peer_name
+    pending_op = "leave"
+
+    print(f"[MANAGER] LEAVE-DHT accepted, waiting for DHT-REBUILT from {peer_name}")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "Leave accepted"
+        }
+    )
+
+
+def handle_join_dht(manager_socket, message, sender_address):
+    global pending_command
+    global pending_peer
+    global pending_op
+
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing JOIN-DHT from {peer_name}")
+
+    if not dht_exists or not dht_complete:
+        failure(manager_socket, sender_address, "DHT does not exist")
+        return
+
+    if peer_name not in peers:
+        failure(manager_socket, sender_address, "Peer is not registered")
+        return
+
+    if peers[peer_name]["state"] != "Free":
+        failure(manager_socket, sender_address, "Peer is not Free")
+        return
+
+    pending_command = "dht-rebuilt"
+    pending_peer = peer_name
+    pending_op = "join"
+
+    print(f"[MANAGER] JOIN-DHT accepted, waiting for DHT-REBUILT from {peer_name}")
+
+    # The joining peer contacts the leader to start the rebuild
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "Join accepted",
+            "leader": peer_tuple(dht_leader)
+        }
+    )
+
+
+def handle_dht_rebuilt(manager_socket, message, sender_address):
+    global dht_leader
+    global dht_members
+    global dht_size
+    global pending_command
+    global pending_peer
+    global pending_op
+
+    peer_name = message.get("peer_name")
+    new_leader = message.get("new_leader")
+
+    print(f"[MANAGER] Processing DHT-REBUILT from {peer_name}, new leader {new_leader}")
+
+    if pending_command != "dht-rebuilt" or peer_name != pending_peer:
+        failure(manager_socket, sender_address, "Peer did not start the rebuild")
+        return
+
+    if pending_op == "leave":
+        new_members = [name for name in dht_members if name != peer_name]
+    else:
+        new_members = dht_members + [peer_name]
+
+    if new_leader not in new_members:
+        failure(manager_socket, sender_address, "New leader is not in the DHT")
+        return
+
+    if pending_op == "leave":
+        peers[peer_name]["state"] = "Free"
+
+    dht_members = new_members
+    dht_leader = new_leader
+    dht_size = len(dht_members)
+    refresh_states()
+
+    pending_command = None
+    pending_peer = None
+    pending_op = None
+
+    print(f"[MANAGER] DHT rebuilt: leader {dht_leader}, members {dht_members}")
+
+    for name in peers:
+        print(f"[MANAGER] {name}: {peers[name]['state']}")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "DHT rebuilt"
+        }
+    )
+
+
+def handle_teardown_dht(manager_socket, message, sender_address):
+    global pending_command
+    global pending_peer
+    global pending_op
+
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing TEARDOWN-DHT from {peer_name}")
+
+    if not dht_exists or not dht_complete:
+        failure(manager_socket, sender_address, "DHT does not exist")
+        return
+
+    if peer_name != dht_leader:
+        failure(manager_socket, sender_address, "Peer is not the DHT leader")
+        return
+
+    pending_command = "teardown-complete"
+    pending_peer = peer_name
+    pending_op = None
+
+    print("[MANAGER] TEARDOWN-DHT accepted, waiting for TEARDOWN-COMPLETE")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "Teardown accepted"
+        }
+    )
+
+
+def handle_teardown_complete(manager_socket, message, sender_address):
+    global pending_command
+    global pending_peer
+
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing TEARDOWN-COMPLETE from {peer_name}")
+
+    if pending_command != "teardown-complete" or peer_name != pending_peer:
+        failure(manager_socket, sender_address, "Peer is not the DHT leader")
+        return
+
+    clear_dht()
+
+    pending_command = None
+    pending_peer = None
+
+    print("[MANAGER] DHT deleted, all DHT peers are Free")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": "DHT deleted"
+        }
+    )
+
+
+def handle_deregister(manager_socket, message, sender_address):
+    peer_name = message.get("peer_name")
+
+    print(f"[MANAGER] Processing DEREGISTER from {peer_name}")
+
+    if peer_name not in peers:
+        failure(manager_socket, sender_address, "Peer is not registered")
+        return
+
+    if peers[peer_name]["state"] != "Free":
+        failure(manager_socket, sender_address, "Peer is in the DHT")
+        return
+
+    del peers[peer_name]
+
+    print(f"[MANAGER] {peer_name} deregistered")
+    print(f"[MANAGER] Registered peers: {list(peers.keys())}")
+
+    send_response(
+        manager_socket,
+        sender_address,
+        {
+            "status": "SUCCESS",
+            "message": f"{peer_name} deregistered"
+        }
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: python3 manager.py <port>")
@@ -396,6 +714,23 @@ def main():
                 )
                 continue
 
+            # Same idea while the DHT is being rebuilt or deleted
+            if pending_command is not None and command != pending_command:
+                print(
+                    f"[MANAGER] Rejecting {command}: "
+                    f"waiting for {pending_command.upper()}"
+                )
+
+                send_response(
+                    manager_socket,
+                    sender_address,
+                    {
+                        "status": "FAILURE",
+                        "message": f"Waiting for {pending_command}"
+                    }
+                )
+                continue
+
             if command == "register":
                 handle_register(
                     manager_socket,
@@ -416,6 +751,27 @@ def main():
                     message,
                     sender_address
                 )
+
+            elif command == "query-dht":
+                handle_query_dht(manager_socket, message, sender_address)
+
+            elif command == "leave-dht":
+                handle_leave_dht(manager_socket, message, sender_address)
+
+            elif command == "join-dht":
+                handle_join_dht(manager_socket, message, sender_address)
+
+            elif command == "dht-rebuilt":
+                handle_dht_rebuilt(manager_socket, message, sender_address)
+
+            elif command == "teardown-dht":
+                handle_teardown_dht(manager_socket, message, sender_address)
+
+            elif command == "teardown-complete":
+                handle_teardown_complete(manager_socket, message, sender_address)
+
+            elif command == "deregister":
+                handle_deregister(manager_socket, message, sender_address)
 
             else:
                 send_response(

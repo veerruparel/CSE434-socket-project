@@ -1,12 +1,24 @@
 import csv
+import glob
 import json
+import os
+import random
 import socket
 import sys
 import threading
 import time
 
 
-DATASET_1950 = "StormEvents_details-ftp_v1.0_d1950_c20260323.csv"
+# Records sent by the leader before it checks the ring counts
+BATCH_SIZE = 50
+
+# Seconds to wait for a ring message to come back around
+RING_TIMEOUT = 60
+
+# Seconds to wait for the leader to refill the DHT
+REBUILD_TIMEOUT = 300
+
+csv.field_size_limit(10 ** 8)
 
 REQUIRED_FIELDS = [
     "EVENT_ID",
@@ -88,6 +100,10 @@ def handle_set_id(message, state):
     state["year"] = message.get("year")
     state["hash_table_size"] = message.get("hash_table_size")
 
+    # Start with an empty local table
+    state["local_hash_table"] = {}
+    state["record_count"] = 0
+
     configure_right_neighbor(state)
 
     right_neighbor = state["right_neighbor"]
@@ -153,22 +169,328 @@ def handle_count_request(message, p_socket, state):
     )
 
 
+def log(state, text):
+    print(f"[PEER {state['peer_name']}] {text}")
+
+
+def tuple_of(state):
+    return {
+        "peer_name": state["peer_name"],
+        "ip": state["peer_ip"],
+        "p_port": state["p_port"]
+    }
+
+
+def clear_ring_state(state):
+    state["id"] = None
+    state["ring_size"] = None
+    state["dht_peers"] = []
+    state["right_neighbor"] = None
+    state["hash_table_size"] = None
+    state["local_hash_table"] = {}
+    state["record_count"] = 0
+
+
+def send_find_response(p_socket, requester, event_id, status, record, id_seq):
+    send_p2p_message(
+        p_socket,
+        requester,
+        {
+            "command": "find-event-response",
+            "status": status,
+            "event_id": event_id,
+            "record": record,
+            "id_seq": id_seq
+        }
+    )
+
+
+def handle_find_event(message, p_socket, state):
+    event_id = message.get("event_id")
+    requester = message.get("requester")
+    id_seq = message.get("id_seq", [])
+    remaining = message.get("remaining")
+
+    if state["id"] is None:
+        log(state, "FIND-EVENT received but this peer is not in a DHT")
+        send_find_response(p_socket, requester, event_id, "FAILURE", None, id_seq)
+        return
+
+    position = event_id % state["hash_table_size"]
+    owner_id = position % state["ring_size"]
+
+    # The first peer starts the id-seq and the set of unvisited ids
+    if not id_seq:
+        id_seq = [state["id"]]
+        remaining = [
+            peer_id
+            for peer_id in range(state["ring_size"])
+            if peer_id != state["id"]
+        ]
+
+    log(
+        state,
+        f"FIND-EVENT {event_id} received: pos={position}, "
+        f"owner id={owner_id}, id-seq={id_seq}"
+    )
+
+    for record in state["local_hash_table"].get(position, []):
+        if int(record["EVENT_ID"]) == event_id:
+            log(state, f"Event {event_id} found, sending SUCCESS to {requester['peer_name']}")
+            send_find_response(p_socket, requester, event_id, "SUCCESS", record, id_seq)
+            return
+
+    # The owner would hold the record, so nobody else has it
+    if state["id"] == owner_id or not remaining:
+        log(state, f"Event {event_id} not found, sending FAILURE to {requester['peer_name']}")
+        send_find_response(p_socket, requester, event_id, "FAILURE", None, id_seq)
+        return
+
+    # Pick next peer randomly (hot potato)
+    next_id = random.choice(remaining)
+    remaining.remove(next_id)
+    id_seq.append(next_id)
+
+    next_peer = state["dht_peers"][next_id]
+
+    log(state, f"Forwarding FIND-EVENT {event_id} to id {next_id} ({next_peer['peer_name']})")
+
+    send_p2p_message(
+        p_socket,
+        next_peer,
+        {
+            "command": "find-event",
+            "event_id": event_id,
+            "requester": requester,
+            "remaining": remaining,
+            "id_seq": id_seq
+        }
+    )
+
+
+def handle_find_response(message, state):
+    event_id = message.get("event_id")
+    id_seq = message.get("id_seq", [])
+    seq_text = ", ".join(str(peer_id) for peer_id in id_seq)
+
+    print("")
+
+    if message.get("status") == "SUCCESS":
+        print(f"[QUERY] Storm event {event_id} found")
+
+        for field in REQUIRED_FIELDS:
+            print(f"[QUERY]   {field.lower()}: {message['record'][field]}")
+
+    else:
+        print(f"Storm event {event_id} not found in the DHT.")
+
+    print(f"[QUERY]   id-seq: {seq_text}")
+
+    state["query_event"].set()
+
+
+def run_teardown(p_socket, state, clear_ring):
+    state["teardown_event"].clear()
+
+    log(state, "Sending TEARDOWN to right neighbor")
+
+    send_p2p_message(
+        p_socket,
+        state["right_neighbor"],
+        {
+            "command": "teardown",
+            "origin": state["peer_name"],
+            "clear_ring": clear_ring
+        }
+    )
+
+    if not state["teardown_event"].wait(timeout=RING_TIMEOUT):
+        log(state, "Timed out waiting for TEARDOWN to return")
+        return False
+
+    return True
+
+
+def handle_teardown(message, p_socket, state):
+    log(state, f"TEARDOWN received (origin {message['origin']}), deleting local hash table")
+
+    state["local_hash_table"] = {}
+    state["record_count"] = 0
+
+    # The peer that started the teardown stops it
+    if message["origin"] == state["peer_name"]:
+        state["teardown_event"].set()
+        return
+
+    send_p2p_message(p_socket, state["right_neighbor"], message)
+
+    if message.get("clear_ring"):
+        clear_ring_state(state)
+
+
+def run_reset_id(p_socket, state, first_id, new_peers):
+    state["reset_event"].clear()
+
+    message = {
+        "command": "reset-id",
+        "id": first_id,
+        "ring_size": len(new_peers),
+        "peers": new_peers,
+        "year": state["year"],
+        "hash_table_size": state["hash_table_size"],
+        "origin": tuple_of(state)
+    }
+
+    log(state, f"Sending RESET-ID {first_id} (ring size {len(new_peers)}) to right neighbor")
+
+    send_p2p_message(p_socket, state["right_neighbor"], message)
+
+    if not state["reset_event"].wait(timeout=RING_TIMEOUT):
+        log(state, "Timed out waiting for RESET-ID to return")
+        return False
+
+    return True
+
+
+def handle_reset_id(message, p_socket, state):
+    origin = message["origin"]
+
+    # Back at the peer that started the renumbering
+    if origin["peer_name"] == state["peer_name"]:
+        log(state, "RESET-ID returned, ring renumbered")
+        state["reset_event"].set()
+        return
+
+    state["id"] = message["id"]
+    state["ring_size"] = message["ring_size"]
+    state["dht_peers"] = message["peers"]
+    state["year"] = message["year"]
+    state["hash_table_size"] = message["hash_table_size"]
+
+    configure_right_neighbor(state)
+
+    log(
+        state,
+        f"RESET-ID received: new ID {state['id']}, "
+        f"ring size {state['ring_size']}, "
+        f"right neighbor {state['right_neighbor']['peer_name']}"
+    )
+
+    forward = dict(message)
+    forward["id"] = state["id"] + 1
+
+    # The last peer reports back to the peer that started it
+    if state["id"] == state["ring_size"] - 1:
+        send_p2p_message(p_socket, origin, forward)
+    else:
+        send_p2p_message(p_socket, state["right_neighbor"], forward)
+
+
+def rebuild_as_leader(p_socket, state, requester):
+    status = "FAILURE"
+
+    try:
+        records = load_dataset(state["year"])
+
+        state["hash_table_size"] = next_prime(2 * len(records))
+
+        log(state, f"Rebuilding DHT as leader: {len(records)} records, s = {state['hash_table_size']}")
+
+        if fill_dht(p_socket, state, records):
+            status = "SUCCESS"
+
+    except (OSError, ValueError) as error:
+        log(state, f"Dataset error: {error}")
+
+    log(state, f"Sending REBUILD-COMPLETE ({status}) to {requester['peer_name']}")
+
+    send_p2p_message(
+        p_socket,
+        requester,
+        {
+            "command": "rebuild-complete",
+            "status": status
+        }
+    )
+
+
+def handle_rebuild_dht(message, p_socket, state):
+    log(state, f"REBUILD-DHT received from {message['requester']['peer_name']}")
+
+    # The ring keeps handling messages while the leader fills it
+    threading.Thread(
+        target=rebuild_as_leader,
+        args=(p_socket, state, message["requester"]),
+        daemon=True
+    ).start()
+
+
+def handle_rebuild_complete(message, state):
+    log(state, f"REBUILD-COMPLETE received: {message.get('status')}")
+
+    state["rebuild_status"] = message.get("status")
+    state["rebuilt_event"].set()
+
+
+def lead_join(p_socket, state, joiner):
+    log(state, f"JOIN-REQUEST received from {joiner['peer_name']}")
+
+    status = "FAILURE"
+
+    if state["id"] == 0:
+        if run_teardown(p_socket, state, False):
+            # Joining peer goes at the end of the ring
+            new_peers = state["dht_peers"] + [joiner]
+
+            state["dht_peers"] = new_peers
+            state["ring_size"] = len(new_peers)
+            configure_right_neighbor(state)
+
+            if run_reset_id(p_socket, state, 1, new_peers):
+                rebuild_as_leader(p_socket, state, joiner)
+                return
+    else:
+        log(state, "This peer is not the leader, ignoring JOIN-REQUEST")
+
+    send_p2p_message(
+        p_socket,
+        joiner,
+        {
+            "command": "rebuild-complete",
+            "status": status
+        }
+    )
+
+
+def handle_join_request(message, p_socket, state):
+    threading.Thread(
+        target=lead_join,
+        args=(p_socket, state, message["requester"]),
+        daemon=True
+    ).start()
+
+
 def listen_for_peer_messages(p_socket, state):
     while True:
         try:
             data, sender_address = p_socket.recvfrom(65535)
+        except OSError:
+            if p_socket.fileno() == -1:
+                break
+            continue
 
-            try:
-                message = json.loads(data.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                print(
-                    f"\n[PEER {state['peer_name']}] "
-                    "Received invalid P2P message"
-                )
-                continue
+        try:
+            message = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            print(
+                f"\n[PEER {state['peer_name']}] "
+                "Received invalid P2P message"
+            )
+            continue
 
-            command = message.get("command")
+        command = message.get("command")
 
+        try:
             if command == "set-id":
                 print(
                     f"\n[PEER {state['peer_name']}] "
@@ -195,14 +517,38 @@ def listen_for_peer_messages(p_socket, state):
                     state
                 )
 
+            elif command == "find-event":
+                handle_find_event(message, p_socket, state)
+
+            elif command == "find-event-response":
+                handle_find_response(message, state)
+
+            elif command == "teardown":
+                handle_teardown(message, p_socket, state)
+
+            elif command == "reset-id":
+                handle_reset_id(message, p_socket, state)
+
+            elif command == "rebuild-dht":
+                handle_rebuild_dht(message, p_socket, state)
+
+            elif command == "rebuild-complete":
+                handle_rebuild_complete(message, state)
+
+            elif command == "join-request":
+                handle_join_request(message, p_socket, state)
+
             else:
                 print(
                     f"\n[PEER {state['peer_name']}] "
                     f"Unknown P2P command: {command}"
                 )
 
-        except OSError:
-            break
+        except Exception as error:
+            print(
+                f"\n[PEER {state['peer_name']}] "
+                f"Error handling {command}: {error}"
+            )
 
 
 def send_manager_request(m_socket, manager_address, message):
@@ -262,17 +608,36 @@ def register_peer(
     return status
 
 
-def load_dataset(year):
-    if year != 1950:
-        raise ValueError(
-            "This milestone implementation currently has "
-            "the provided 1950 dataset available."
-        )
+def find_dataset(year):
+    folders = [
+        os.getcwd(),
+        os.path.dirname(os.path.abspath(__file__))
+    ]
 
+    patterns = [
+        f"StormEvents_details-ftp_v1.0_d{year}_c*.csv",
+        f"details-{year}.csv"
+    ]
+
+    for folder in folders:
+        for pattern in patterns:
+            matches = sorted(
+                glob.glob(os.path.join(folder, pattern))
+            )
+
+            if matches:
+                return matches[-1]
+
+    raise FileNotFoundError(
+        f"No dataset file found for year {year}"
+    )
+
+
+def load_dataset(year):
     records = []
 
     with open(
-        DATASET_1950,
+        find_dataset(year),
         "r",
         encoding="utf-8-sig",
         newline=""
@@ -340,6 +705,8 @@ def distribute_records(p_socket, state, records):
         f"Distributing {total} storm records"
     )
 
+    sent = 0
+
     for record in records:
         event_id = int(record["EVENT_ID"])
 
@@ -366,13 +733,30 @@ def distribute_records(p_socket, state, records):
                 }
             )
 
+        sent += 1
+
+        # Let the ring catch up so UDP buffers do not overflow
+        if sent % BATCH_SIZE == 0:
+            if not request_counts(p_socket, state):
+                return False
+
+            if state["distributed_total"] != sent:
+                print(
+                    f"[PEER {state['peer_name']}] "
+                    f"ERROR: sent {sent} records but ring "
+                    f"holds {state['distributed_total']}"
+                )
+                return False
+
     print(
         f"[PEER {state['peer_name']}] "
         "Finished sending storm records"
     )
 
+    return True
 
-def collect_record_counts(p_socket, state):
+
+def request_counts(p_socket, state):
     state["count_event"].clear()
     state["final_counts"] = {}
 
@@ -404,10 +788,22 @@ def collect_record_counts(p_socket, state):
         )
         return False
 
+    total = 0
+
+    for peer_id in range(state["ring_size"]):
+        total += state["final_counts"][str(peer_id)]["count"]
+
+    state["distributed_total"] = total
+
+    return True
+
+
+def collect_record_counts(p_socket, state):
+    if not request_counts(p_socket, state):
+        return False
+
     print("")
     print("[DHT] Record distribution:")
-
-    total = 0
 
     for peer_id in range(state["ring_size"]):
         info = state["final_counts"][str(peer_id)]
@@ -418,11 +814,34 @@ def collect_record_counts(p_socket, state):
             f"{info['count']} records"
         )
 
-        total += info["count"]
+    print(f"[DHT] Total records: {state['distributed_total']}")
 
-    print(f"[DHT] Total records: {total}")
+    return True
 
-    state["distributed_total"] = total
+
+def fill_dht(p_socket, state, records):
+    state["local_hash_table"] = {}
+    state["record_count"] = 0
+
+    if not distribute_records(p_socket, state, records):
+        return False
+
+    if not collect_record_counts(p_socket, state):
+        return False
+
+    # Total should match the number of rows read from the file
+    if state["distributed_total"] != len(records):
+        print(
+            f"[PEER {state['peer_name']}] "
+            f"ERROR: expected {len(records)} records "
+            f"but counted {state['distributed_total']}"
+        )
+        return False
+
+    print(
+        f"[PEER {state['peer_name']}] "
+        "All records accounted for"
+    )
 
     return True
 
@@ -500,33 +919,12 @@ def build_dht(
 
     time.sleep(0.5)
 
-    distribute_records(
+    if not fill_dht(
         p_socket,
         state,
         records
-    )
-
-    time.sleep(1)
-
-    if not collect_record_counts(
-        p_socket,
-        state
     ):
         return
-
-    # Total should match the number of rows read from the file
-    if state["distributed_total"] != record_count:
-        print(
-            f"[PEER {state['peer_name']}] "
-            f"ERROR: expected {record_count} records "
-            f"but counted {state['distributed_total']}"
-        )
-        return
-
-    print(
-        f"[PEER {state['peer_name']}] "
-        "All records accounted for"
-    )
 
     send_dht_complete(
         m_socket,
@@ -638,6 +1036,161 @@ def setup_dht(
     )
 
 
+def manager_command(m_socket, manager_address, state, command, **fields):
+    message = {
+        "command": command,
+        "peer_name": state["peer_name"]
+    }
+
+    message.update(fields)
+
+    log(state, f"Sending {command.upper()} to manager")
+
+    response = send_manager_request(m_socket, manager_address, message)
+
+    log(state, f"{command.upper()} response: {response.get('status', 'FAILURE')}")
+    log(state, response.get("message", ""))
+
+    return response
+
+
+def query_dht(m_socket, p_socket, manager_address, state, event_id):
+    response = manager_command(m_socket, manager_address, state, "query-dht")
+
+    if response.get("status") != "SUCCESS":
+        return
+
+    target = response["peer"]
+
+    state["query_event"].clear()
+
+    log(state, f"Sending FIND-EVENT {event_id} to {target['peer_name']}")
+
+    send_p2p_message(
+        p_socket,
+        target,
+        {
+            "command": "find-event",
+            "event_id": event_id,
+            "requester": tuple_of(state),
+            "remaining": None,
+            "id_seq": []
+        }
+    )
+
+    if not state["query_event"].wait(timeout=RING_TIMEOUT):
+        log(state, "Timed out waiting for the query response")
+
+
+def leave_dht(m_socket, p_socket, manager_address, state):
+    response = manager_command(m_socket, manager_address, state, "leave-dht")
+
+    if response.get("status") != "SUCCESS":
+        return
+
+    my_id = state["id"]
+    old_peers = state["dht_peers"]
+    new_leader = state["right_neighbor"]
+
+    # New ring starts at my right neighbor and skips me
+    new_peers = old_peers[my_id + 1:] + old_peers[:my_id]
+
+    # Step 1: teardown
+    if not run_teardown(p_socket, state, False):
+        return
+
+    # Step 2: renumber the remaining peers
+    if not run_reset_id(p_socket, state, 0, new_peers):
+        return
+
+    # Step 3: new leader rebuilds the DHT
+    state["rebuilt_event"].clear()
+
+    log(state, f"Sending REBUILD-DHT to new leader {new_leader['peer_name']}")
+
+    send_p2p_message(
+        p_socket,
+        new_leader,
+        {
+            "command": "rebuild-dht",
+            "requester": tuple_of(state)
+        }
+    )
+
+    if not state["rebuilt_event"].wait(timeout=REBUILD_TIMEOUT) or state["rebuild_status"] != "SUCCESS":
+        log(state, "DHT rebuild failed")
+        return
+
+    # Step 4: tell the manager
+    manager_command(
+        m_socket,
+        manager_address,
+        state,
+        "dht-rebuilt",
+        new_leader=new_leader["peer_name"]
+    )
+
+    clear_ring_state(state)
+
+    log(state, "Left the DHT and is now Free")
+
+
+def join_dht(m_socket, p_socket, manager_address, state):
+    response = manager_command(m_socket, manager_address, state, "join-dht")
+
+    if response.get("status") != "SUCCESS":
+        return
+
+    leader = response["leader"]
+
+    state["rebuilt_event"].clear()
+
+    log(state, f"Sending JOIN-REQUEST to leader {leader['peer_name']}")
+
+    send_p2p_message(
+        p_socket,
+        leader,
+        {
+            "command": "join-request",
+            "requester": tuple_of(state)
+        }
+    )
+
+    if not state["rebuilt_event"].wait(timeout=REBUILD_TIMEOUT) or state["rebuild_status"] != "SUCCESS":
+        log(state, "DHT rebuild failed")
+        return
+
+    manager_command(
+        m_socket,
+        manager_address,
+        state,
+        "dht-rebuilt",
+        new_leader=leader["peer_name"]
+    )
+
+    log(state, f"Joined the DHT with ID {state['id']}")
+
+
+def teardown_dht(m_socket, p_socket, manager_address, state):
+    response = manager_command(m_socket, manager_address, state, "teardown-dht")
+
+    if response.get("status") != "SUCCESS":
+        return
+
+    if not run_teardown(p_socket, state, True):
+        return
+
+    clear_ring_state(state)
+
+    manager_command(m_socket, manager_address, state, "teardown-complete")
+
+
+def deregister_peer(m_socket, manager_address, state):
+    response = manager_command(m_socket, manager_address, state, "deregister")
+
+    return response.get("status") == "SUCCESS"
+
+
 def main():
     if len(sys.argv) != 3:
         print(
@@ -689,7 +1242,12 @@ def main():
         "record_count": 0,
         "final_counts": {},
         "distributed_total": 0,
-        "count_event": threading.Event()
+        "count_event": threading.Event(),
+        "teardown_event": threading.Event(),
+        "reset_event": threading.Event(),
+        "rebuilt_event": threading.Event(),
+        "query_event": threading.Event(),
+        "rebuild_status": None
     }
 
     m_socket = None
@@ -875,6 +1433,61 @@ def main():
                     n,
                     year
                 )
+
+            elif command in (
+                "query-dht",
+                "leave-dht",
+                "join-dht",
+                "teardown-dht",
+                "deregister"
+            ):
+                expected = 3 if command == "query-dht" else 2
+
+                if len(parts) != expected:
+                    if command == "query-dht":
+                        print("Usage: query-dht <peer-name> <event-id>")
+                    else:
+                        print(f"Usage: {command} <peer-name>")
+                    continue
+
+                if not state["registered"]:
+                    print("[PEER] This peer is not registered.")
+                    continue
+
+                if parts[1] != state["peer_name"]:
+                    print(
+                        f"[PEER {state['peer_name']}] "
+                        "Peer name must match this peer."
+                    )
+                    continue
+
+                if command == "query-dht":
+                    try:
+                        event_id = int(parts[2])
+                    except ValueError:
+                        print("[PEER] event-id must be an integer.")
+                        continue
+
+                    query_dht(
+                        m_socket,
+                        p_socket,
+                        manager_address,
+                        state,
+                        event_id
+                    )
+
+                elif command == "leave-dht":
+                    leave_dht(m_socket, p_socket, manager_address, state)
+
+                elif command == "join-dht":
+                    join_dht(m_socket, p_socket, manager_address, state)
+
+                elif command == "teardown-dht":
+                    teardown_dht(m_socket, p_socket, manager_address, state)
+
+                elif deregister_peer(m_socket, manager_address, state):
+                    print(f"[PEER {state['peer_name']}] Peer exiting.")
+                    break
 
             else:
                 print(
